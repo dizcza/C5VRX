@@ -97,6 +97,8 @@ static void render_splash(void)
     sync_dma_c2m(s_raster.ui, sizeof(s_raster.ui));
 }
 
+static bool s_progressive_only;   /* menu_splash_begin: build the progressive chain */
+
 bool menu_splash_active(void) { return s_splash >= 0; }
 
 /* The logo on the menu raster while the receiver tasks start (main.c).
@@ -105,7 +107,14 @@ bool menu_splash_active(void) { return s_splash >= 0; }
 bool menu_splash_begin(void)
 {
     s_splash = 0;
-    if (menu_open()) return true;
+    /* The splash is the boot heap peak: its chain is live while the receiver
+     * tasks are created. Interlaced it takes ~18 KB and left ~1 KB, so a
+     * slightly larger boot (stored calibration tables) aborted xTaskCreate
+     * in a boot loop. The progressive field needs half the descriptors. */
+    s_progressive_only = true;
+    const bool open = menu_open();
+    s_progressive_only = false;
+    if (open) return true;
     s_splash = -1;
     printf("SPLASH skipped (menu raster could not take TX)\n");
     return false;
@@ -272,9 +281,9 @@ static esp_err_t reserve_chain(video_standard_t standard, bool interlaced, unsig
 static esp_err_t build_chain(video_standard_t standard)
 {
     unsigned required = 0;
-    bool interlaced = true;
-    esp_err_t err = reserve_chain(standard, true, &required);
-    if (err == ESP_ERR_NO_MEM) {
+    bool interlaced = !s_progressive_only;
+    esp_err_t err = reserve_chain(standard, interlaced, &required);
+    if (err == ESP_ERR_NO_MEM && interlaced) {
         interlaced = false;
         err = reserve_chain(standard, false, &required);
         if (err == ESP_OK) printf("[MENU] progressive fallback: interlaced chain did not fit\n");

@@ -9,6 +9,12 @@
 #include "esp_timer.h"
 #include "rf.h"
 #include "phy.h"
+#include "esp_heap_caps.h"
+#include "soc/pcr_struct.h"
+
+/* Free internal heap at each boot stage (BOOT_HEAP lines). */
+#define BOOT_STAGE(name) do { s_boot_stage = (name); printf("BOOT_HEAP stage=%s free=%u min=%u\n", (name), \
+    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)); } while (0)
 
 volatile const char *s_boot_stage = "start";
 static int64_t s_boot_radio_ms = -1, s_boot_ready_ms = -1;
@@ -41,6 +47,15 @@ static void splash_wait_gain(int64_t t0, uint32_t holds, int64_t deadline)
 void app_main(void)
 {
     const int64_t app_t0 = esp_timer_get_time();
+    /* Keep UART0 clocked. With the console on USB-Serial-JTAG, ESP-IDF gates
+     * UART0 at a power-on boot (esp_perip_clk_init); that gate survives a
+     * USB-Serial-JTAG reset (rst:0x15, sent by the host via DTR/RTS, e.g. when
+     * Linux opens the port), and after it the ROM spins in its UART0 init
+     * (uart_hal_init_reset) before the app or the download loader runs: the
+     * board hangs until power is removed. Software (panic) resets were seen
+     * to reboot fine. */
+    PCR.uart0_conf.uart0_clk_en = 1;
+    PCR.uart0_sclk_conf.uart0_sclk_en = 1;
     /* USB output never blocks a task when no host is attached. */
     setvbuf(stdin, NULL, _IONBF, 0);
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -55,18 +70,18 @@ void app_main(void)
         printf("CONTROL stack reservation failed; USB status/download remain available\n");
         return;
     }
-    s_boot_stage = "rf";
+    BOOT_STAGE("rf");
     ESP_ERROR_CHECK(rf_start());
     s_boot_radio_ms = (esp_timer_get_time() - app_t0) / 1000;
     printf("BOOT_TIMING radio_ms=%lld\n", s_boot_radio_ms);
-    s_boot_stage = "settings";
+    BOOT_STAGE("settings");
     settings_load();
-    s_boot_stage = "flightlog";
+    BOOT_STAGE("flightlog");
     flightlog_start();
     /* Start at the first index of the highest RF stage; Direct Gain takes
      * over at once (table maximum without a carrier). */
     receiver_set_gain(arc_gain_highest_rf_stage_start(rf_gain_table()));
-    s_boot_stage = "calibration";
+    BOOT_STAGE("calibration");
     calibration_start();
     /* The receive profile (filter class + tracker) of this channel is
      * chosen before live TX starts; it never changes under live video. */
@@ -87,25 +102,26 @@ void app_main(void)
         if (blob_load("demod", &demod, sizeof(demod)) && demod < TRANSPORT_DEMODS && transport_set_demod(demod))
             printf("PREFS restored demod=%s\n", transport_demod_name(demod));
     }
-    s_boot_stage = "transport";
+    BOOT_STAGE("transport");
     if (transport_start() != ESP_OK) {
-        s_boot_stage = "transport_fault";
+        BOOT_STAGE("transport_fault");
         printf("TRANSPORT boot failed: live OFF; USB status/download remain available\n");
         return;
     }
-    s_boot_stage = "splash";
+    BOOT_STAGE("splash");
     const int64_t splash_t0 = esp_timer_get_time();
     const uint32_t splash_holds = s_gain.holds;
     /* Leave one second of a ten-second target for final TX handover.
      * Never add a fixed warning screen after the normal splash. */
     const int64_t ready_deadline = app_t0 + 9000000;
     const bool splash = esp_timer_get_time() < ready_deadline && menu_splash_begin();
-    s_boot_stage = "tasks";
+    BOOT_STAGE("tasks");
     receiver_start();
     control_start();
+    BOOT_STAGE("tasks_started");
     if (splash) splash_wait_gain(splash_t0, splash_holds, ready_deadline);
     menu_splash_end();
-    s_boot_stage = "ready";
+    BOOT_STAGE("ready");
     s_boot_ready_ms = (esp_timer_get_time() - app_t0) / 1000;
     printf("BOOT_TIMING ready_ms=%lld target_ms=10000\n", s_boot_ready_ms);
     char gain_name[16];

@@ -319,7 +319,7 @@ void flightlog_start(void)
     session_record();
     printf("FLOG ready session=%lu block=%u seq=%lu snapshots_next=%lu\n", (unsigned long)s_session, s_block,
            (unsigned long)s_seq, (unsigned long)s_snap_seq);
-    if (xTaskCreate(logger_task, "flightlog", 3072, NULL, 1, NULL) != pdPASS) {
+    if (xTaskCreate(logger_task, "flightlog", 2048, NULL, 1, NULL) != pdPASS) {
         s_ready = false;
         printf("FLOG task failed; flight log off\n");
     }

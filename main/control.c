@@ -706,6 +706,12 @@ void control_print_beat(void)
            profile_live_mode(), menu_status_active(), firmware_id());
 }
 
+void control_picture_counts(uint32_t *found, uint32_t *expected)
+{
+    *found = s_pic.found;
+    *expected = s_pic.expected;
+}
+
 void control_flog_afc(int16_t *offset_khz, int16_t *residual_khz, uint32_t *corrections)
 {
     *offset_khz = (int16_t)rf_offset_khz();

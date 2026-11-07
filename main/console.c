@@ -8,7 +8,9 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 #include "hal/usb_serial_jtag_ll.h"
+#include "oled.h"
 #include "rf.h"
 #include "snapshot.h"
 
@@ -54,6 +56,7 @@ static void status(void)
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_RTCRAM),
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), firmware_id());
     control_print();
+    oled_print();
     receiver_print();
     profile_print();
     calibration_print();
@@ -139,6 +142,21 @@ static void usb_reader_task(void *arg)
     }
 }
 
+/* K: free stack (bytes never used since boot) of every known task, and the
+ * heap; sizes the stacks against the boot heap peak. */
+static void stack_report(void)
+{
+    static const char *const names[] = {"console", "usb_reader", "control", "calibration", "flightlog", "gain_obs",
+                                        "gain_fast", "IDLE", "esp_timer", "sys_evt", "Tmr Svc", "wifi", "main"};
+    printf("STACKS tasks=%u", (unsigned)uxTaskGetNumberOfTasks());
+    for (unsigned k = 0; k < sizeof(names) / sizeof(names[0]); ++k) {
+        TaskHandle_t t = xTaskGetHandle(names[k]);
+        if (t) printf(" %s=%u", names[k], (unsigned)uxTaskGetStackHighWaterMark(t));
+    }
+    printf(" heap_internal=%u heap_min=%u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+}
+
 static void console_task(void *arg)
 {
     (void)arg;
@@ -156,6 +174,7 @@ static void console_task(void *arg)
             switch (c) {
             case 'S': sense_lab_help(); sense_until = esp_timer_get_time() + 5000000; break;
             case 'T': status(); break;
+            case 'K': stack_report(); break;
             case 'I': snapshot(); break;
             case 'F': filter_request(); break;
             case 'B': filter_request_full(); break;
@@ -177,6 +196,7 @@ static void console_task(void *arg)
             }
         }
         diag_poll();
+        oled_poll();
         /* Bank-1 watch: prints only when a layer changes (rf_bank1_check). */
         static int64_t bank1_beat;
         if (esp_timer_get_time() - bank1_beat >= 5000000 && !calibration_in_startup()) {
@@ -196,8 +216,8 @@ void console_start(void)
 {
     s_keys = xQueueCreate(64, 1);
     ESP_ERROR_CHECK(s_keys ? ESP_OK : ESP_ERR_NO_MEM);
-    ESP_ERROR_CHECK(xTaskCreate(console_task, "console", 6144, NULL, 2, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
-    ESP_ERROR_CHECK(xTaskCreate(usb_reader_task, "usb_reader", 3072, NULL, 10, NULL) == pdPASS ? ESP_OK :
+    ESP_ERROR_CHECK(xTaskCreate(console_task, "console", 4096, NULL, 2, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(usb_reader_task, "usb_reader", 2048, NULL, 10, NULL) == pdPASS ? ESP_OK :
                     ESP_ERR_NO_MEM);
 }
 
