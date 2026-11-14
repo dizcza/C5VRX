@@ -192,6 +192,7 @@ void control_print(void);
 void control_print_beat(void);   /* STATUS line every 2 s (console.c) */
 /* Sync pulses found / expected in the decoded control windows since boot (PICTURE). */
 void control_picture_counts(uint32_t *found, uint32_t *expected);
+char control_scan_phase(void);   /* SCAN phase A/B/C, or a space */
 
 /* ---- calibration*.c (module-internal: calibration_internal.h) ---- */
 void calibration_start(void);

@@ -157,7 +157,7 @@ static void compose(char out[OLED_LINES][OLED_BUF])
     if (s_menu_active)
         snprintf(out[3], OLED_BUF, "MENU");
     else if (s_scan_active)
-        snprintf(out[3], OLED_BUF, "SCAN %3u%%", s_scan_progress);
+        snprintf(out[3], OLED_BUF, "SCAN %c %3u%%", control_scan_phase(), s_scan_progress);
     else {
         vq_t vq;
         control_video_quality(&vq);
