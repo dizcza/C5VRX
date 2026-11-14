@@ -277,7 +277,13 @@ static bool scan_cancelled(void)
 typedef struct {
     uint8_t scan_gain, max_gain;
     uint32_t tunes, tune_us_sum, tune_us_max;
+    uint16_t home_mhz;      /* revisited every SEARCH_HOME_EVERY probes; 0 = never */
+    unsigned since_home;
+    bool home_hit;          /* the last search_phase returned on video at home */
 } search_ctx_t;
+/* Back to the last channel with video every 25 probes (~5 s): a VTX that
+ * only dropped out (power cycle, PIT, a fade) is picked up there again. */
+#define SEARCH_HOME_EVERY 25u
 
 static bool search_tune(search_ctx_t *x, uint16_t mhz)
 {
@@ -304,6 +310,7 @@ static bool search_phase(search_ctx_t *x, char phase, const uint16_t *list, unsi
                          int *best_off, bool *cancel)
 {
     int best_quality = -1, best_video = -1;
+    x->home_hit = false;
     s_scan_phase_ch = phase;
     const int64_t t0 = esp_timer_get_time();
     for (unsigned k = 0; k < n; ++k) {
@@ -312,6 +319,15 @@ static bool search_phase(search_ctx_t *x, char phase, const uint16_t *list, unsi
         if (s_menu_active) menu_render();
         analog_video_t v;
         int quality = 0;
+        if (x->home_mhz && ++x->since_home >= SEARCH_HOME_EVERY) {
+            x->since_home = 0;
+            if (search_probe(x, x->home_mhz, &v, &quality)) {
+                printf("SCAN home %u MHz video=%d offset_khz=%d quality=%d\n", x->home_mhz, v.confidence,
+                       v.offset_khz, quality);
+                *best_mhz = x->home_mhz; *best_off = v.offset_khz; x->home_hit = true;
+                return true;
+            }
+        }
         if (!search_probe(x, list[k], &v, &quality)) continue;
         printf("SCAN %c candidate %u MHz video=%d offset_khz=%d quality=%d %s\n", phase, list[k], v.confidence,
                v.offset_khz, quality, v.standard == 1 ? "PAL" : "NTSC");
@@ -374,13 +390,23 @@ static bool search_settle(search_ctx_t *x, uint16_t best_mhz, int best_off)
     return false;
 }
 
-static void scan(void)
+#define AUTO_SCAN_LOSS_US INT64_C(3000000)
+extern volatile const char *s_boot_stage;   /* main.c */
+static bool s_auto_scan = true;        /* console a; not saved: every boot ON */
+static bool s_auto_suspended;           /* cancelled: until video is seen again */
+static int64_t s_auto_scan_end_us;
+
+/* manual: console s / menu SCAN. automatic: video lost for AUTO_SCAN_LOSS_US
+ * (control loop); the current frequency is the home, revisited while
+ * searching. Both end on video or on a cancel. */
+static void scan_run(bool automatic)
 {
-    if (!receiver_pause("SCAN")) return;
+    if (!receiver_pause(automatic ? "AUTOSCAN" : "SCAN")) return;
     const size_t original = rf_channel_index();
     const bool original_custom = rf_channel_custom();
     const uint16_t original_mhz = rf_frequency_mhz();
-    search_ctx_t x = {.scan_gain = 52u, .max_gain = rf_gain_table()->max_index};
+    search_ctx_t x = {.scan_gain = 52u, .max_gain = rf_gain_table()->max_index,
+                      .home_mhz = automatic ? rf_frequency_mhz() : 0u};
 
     /* Phase lists (static: the control stack is reserved and small). */
     static uint16_t known[SEARCH_KNOWN_MAX], edges[64], span[128];
@@ -402,7 +428,8 @@ static void scan(void)
     s_scan_progress = 0;
     s_scan_button_armed = false;
     receiver_set_gain(x.scan_gain);   /* every step compared at one gain */
-    printf("SCAN start known=%u (%u..%u MHz) edges=%u span=%u step=%u MHz; any key or BOOT cancels\n", nk, lo, hi,
+    printf("SCAN start %s home=%u known=%u (%u..%u MHz) edges=%u span=%u step=%u MHz; any key or BOOT cancels\n",
+           automatic ? "auto" : "manual", x.home_mhz, nk, lo, hi,
            ne, ns, SEARCH_STEP_MHZ);
     bool found = false, cancel = false;
     unsigned cycle = 0;
@@ -420,8 +447,10 @@ static void scan(void)
     if (!found) {
         if (original_custom) (void)rf_tune_mhz(original_mhz);
         else (void)rf_set_channel(original);
+        if (automatic) s_auto_suspended = true;
     }
     s_scan_active = false;
+    s_auto_scan_end_us = esp_timer_get_time();
     s_scan_phase_ch = ' ';
     receiver_set_gain(x.max_gain);
     receiver_resume();
@@ -533,7 +562,7 @@ static void menu_action(void)
     switch (s_menu_cursor) {
     case MENU_BAND: rf_next_band(); after_retune(); break;
     case MENU_CHANNEL: rf_next_channel(); after_retune(); break;
-    case MENU_SCAN: scan(); break;
+    case MENU_SCAN: scan_run(false); break;
     case MENU_FILTER: (void)profile_select_cycle(); prefs_save(); break;
     case MENU_AFC: toggle_afc(); break;
     case MENU_DFILT: cycle_dfilt(); break;
@@ -578,7 +607,13 @@ static void command(int c, unsigned *menu_idle)
     case 'x': if (s_menu_active) menu_action(); break;
     case 'c': rf_next_channel(); after_retune(); break;
     case 'b': rf_next_band(); after_retune(); break;
-    case 's': scan(); break;
+    case 's': s_auto_suspended = false; scan_run(false); break;
+    case 'a':
+        s_auto_scan = !s_auto_scan;
+        s_auto_suspended = false;
+        printf("AUTOSCAN %s (no video for %u s starts a search that revisits the last channel)\n",
+               s_auto_scan ? "ON" : "OFF", (unsigned)(AUTO_SCAN_LOSS_US / 1000000));
+        break;
     case 'A': {
         profile_set_live_mode(!profile_live_mode());
         printf("PROFILE live switch %s (saved): %s\n", profile_live_mode() ? "ON" : "OFF",
@@ -751,6 +786,27 @@ static void control_task(void *arg)
             s_cfo_khz = 0;
             afc2_ctrl_invalidate(&afc);
             settle = own_write ? 2u : RETUNE_SETTLE_TICKS;
+        }
+        /* AUTOSCAN: no video for 3 s (counted from boot ready, the last
+         * video and the last search) starts a search; a cancel waits for
+         * video again. Never over a menu, calibration or another owner. */
+        {
+            static int64_t ready_us;
+            const int64_t now_us = esp_timer_get_time();
+            if (!ready_us && strcmp((const char *)s_boot_stage, "ready") == 0) ready_us = now_us;
+            const int64_t video_us = s_last_video_us;
+            if (video_us && now_us - video_us < 1000000) s_auto_suspended = false;
+            int64_t since = ready_us;
+            if (video_us > since) since = video_us;
+            if (s_auto_scan_end_us > since) since = s_auto_scan_end_us;
+            if (s_auto_scan && !s_auto_suspended && ready_us && now_us - since > AUTO_SCAN_LOSS_US &&
+                !s_menu_active && !s_scan_active && !menu_status_active() && !menu_splash_active() &&
+                !receiver_paused() && !phy_busy() && !calibration_in_startup()) {
+                printf("AUTOSCAN no video for %lld ms on %s %u MHz\n", (now_us - since) / 1000, rf_channel()->name,
+                       rf_frequency_mhz());
+                scan_run(true);
+                continue;
+            }
         }
         uint32_t gain_epoch = s_gain_epoch, ctx = afc_context();
         if (s_scan_active) {
