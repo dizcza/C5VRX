@@ -166,8 +166,8 @@ static void after_retune(void)
     settings_save();
     profile_channel_changed();   /* another channel may carry another VTX */
     if (s_menu_active) menu_render();
-    printf("[CHANNEL] %s %u MHz%s\n", rf_channel()->name, rf_channel()->freq_mhz,
-           rf_freq_in_spec(rf_channel()->freq_mhz) ? "" : " (above the documented C5 range, not characterised)");
+    printf("[CHANNEL] %s %u MHz%s\n", rf_channel()->name, rf_frequency_mhz(),
+           rf_freq_in_spec(rf_frequency_mhz()) ? "" : " (above the documented C5 range, not characterised)");
 }
 
 /* ---- Channel scanner -------------------------------------------------------
@@ -212,51 +212,102 @@ static analog_video_t channel_confidence(uint8_t scan_gain, uint8_t max_gain, in
     return video;
 }
 
+/* Frequency sweep (2026-11-14): every SWEEP_STEP_MHZ from RF_SWEEP_MIN_MHZ to
+ * RF_SWEEP_MAX_MHZ instead of only the 48 table channels, so a VTX on any
+ * frequency (another L-band table, a custom SmartAudio frequency) is found.
+ * The filter passes a VTX several MHz off the tuned frequency, so the
+ * strongest qualified step lands within ~5 MHz of the carrier; the
+ * offset estimate (sign not relied on: both directions are probed) then
+ * moves it to the whole MHz with the smallest residual, which the AFC
+ * trims. A result within 3 MHz of a table channel selects that channel;
+ * otherwise a custom frequency is kept (not saved across reboots). */
+#define SWEEP_STEP_MHZ 8u   /* board 2026-11-14: a VTX still qualifies 7 MHz off */
+#define SWEEP_SNAP_MHZ 3
+
+static bool sweep_probe(uint16_t mhz, uint8_t scan_gain, uint8_t max_gain, analog_video_t *v)
+{
+    if (mhz < RF_SWEEP_MIN_MHZ || mhz > RF_SWEEP_MAX_MHZ || rf_tune_mhz(mhz) != ESP_OK) return false;
+    *v = channel_confidence(scan_gain, max_gain, NULL);
+    return v->confidence >= ANALOG_VIDEO_MIN_CONFIDENCE;
+}
+
 static void scan(void)
 {
     if (!receiver_pause("SCAN")) return;
     const size_t original = rf_channel_index();
+    const bool original_custom = rf_channel_custom();
+    const uint16_t original_mhz = rf_frequency_mhz();
     const uint8_t max_gain = rf_gain_table()->max_index, scan_gain = 52u;
-    size_t best = original;
-    int best_quality = -1, best_video = -1, best_offset = 0x7fffffff;
+    const unsigned steps = (RF_SWEEP_MAX_MHZ - RF_SWEEP_MIN_MHZ) / SWEEP_STEP_MHZ + 1u;
+    uint16_t best_mhz = 0;
+    int best_quality = -1, best_video = -1, best_off = 0;
     s_scan_active = true;
     s_scan_progress = 0;
-    receiver_set_gain(scan_gain);   /* every channel compared at one gain */
-    for (size_t ch = 0; ch < FPV_CHANNELS; ++ch) {
-        s_scan_progress = (unsigned)(ch * 100u / FPV_CHANNELS);
+    receiver_set_gain(scan_gain);   /* every step compared at one gain */
+    printf("SCAN sweep %u..%u MHz step %u MHz (%u steps)\n", RF_SWEEP_MIN_MHZ, RF_SWEEP_MAX_MHZ, SWEEP_STEP_MHZ, steps);
+    for (unsigned k = 0; k < steps; ++k) {
+        const uint16_t mhz = (uint16_t)(RF_SWEEP_MIN_MHZ + k * SWEEP_STEP_MHZ);
+        s_scan_progress = k * 90u / steps;
         if (s_menu_active) menu_render();
-        if (rf_set_channel(ch) != ESP_OK) continue;
+        if (rf_tune_mhz(mhz) != ESP_OK) continue;
         int quality = 0;
         analog_video_t v = channel_confidence(scan_gain, max_gain, &quality);
         if (v.confidence < ANALOG_VIDEO_MIN_CONFIDENCE) continue;
-        int off = abs(v.offset_khz);
-        printf("SCAN candidate %s %u MHz video=%d offset_khz=%d quality=%d %s\n", rf_channel()->name,
-               rf_channel()->freq_mhz, v.confidence, v.offset_khz, quality, v.standard == 1 ? "PAL" : "NTSC");
-        bool centred = off <= 3000, best_centred = best_offset <= 3000;
-        if ((centred && !best_centred) ||
-            (centred == best_centred &&
-             (quality > best_quality ||
-              (quality == best_quality &&
-               (off / 500 < best_offset / 500 ||
-                (off / 500 == best_offset / 500 && v.confidence > best_video)))))) {
-            best = ch;
+        printf("SCAN candidate %u MHz video=%d offset_khz=%d quality=%d %s\n", mhz, v.confidence,
+               v.offset_khz, quality, v.standard == 1 ? "PAL" : "NTSC");
+        if (quality > best_quality || (quality == best_quality && v.confidence > best_video)) {
+            best_mhz = mhz;
             best_quality = quality;
             best_video = v.confidence;
-            best_offset = off;
+            best_off = v.offset_khz;
         }
     }
-    /* Confirm the winner: still video, still centred. */
-    if (best_video >= 0) {
-        (void)rf_set_channel(best);
-        analog_video_t v = channel_confidence(scan_gain, max_gain, NULL);
-        if (v.confidence < ANALOG_VIDEO_MIN_CONFIDENCE || abs(v.offset_khz) > 3000) best_video = -1;
+    /* Refine to 1 MHz: two rounds of probing best +- |offset|. */
+    for (unsigned round = 0; best_video >= 0 && round < 2u; ++round) {
+        s_scan_progress = 92u + round * 4u;
+        if (s_menu_active) menu_render();
+        const int d = (abs(best_off) + 500) / 1000;
+        if (d == 0) break;
+        uint16_t base = best_mhz;
+        for (int sign = -1; sign <= 1; sign += 2) {
+            const uint16_t mhz = (uint16_t)((int)base + sign * d);
+            analog_video_t v;
+            if (!sweep_probe(mhz, scan_gain, max_gain, &v)) continue;
+            printf("SCAN refine %u MHz video=%d offset_khz=%d\n", mhz, v.confidence, v.offset_khz);
+            if (abs(v.offset_khz) < abs(best_off)) { best_mhz = mhz; best_off = v.offset_khz; best_video = v.confidence; }
+        }
+        if (best_mhz == base) break;
     }
-    if (best_video < 0) best = original;
-    (void)rf_set_channel(best);
+    bool found = false;
+    if (best_video >= 0) {
+        size_t snap = FPV_CHANNELS;
+        int snap_d = SWEEP_SNAP_MHZ + 1;
+        for (size_t i = 0; i < FPV_CHANNELS; ++i) {
+            int dd = abs((int)rf_channel_freq(i) - (int)best_mhz);
+            if (dd < snap_d) { snap = i; snap_d = dd; }
+        }
+        /* Confirm on the snapped table channel, else on the refined
+         * frequency itself; one detection window can miss (board: a
+         * single confirm rejected a locked VTX), so up to three looks. */
+        for (unsigned pass = 0; pass < 2u && !found; ++pass) {
+            if (pass == 0 && snap >= FPV_CHANNELS) continue;
+            if ((pass == 0 ? rf_set_channel(snap) : rf_tune_mhz(best_mhz)) != ESP_OK) continue;
+            for (unsigned look = 0; look < 3u && !found; ++look) {
+                analog_video_t v = channel_confidence(scan_gain, max_gain, NULL);
+                found = v.confidence >= ANALOG_VIDEO_MIN_CONFIDENCE && abs(v.offset_khz) <= 3000;
+                printf("SCAN confirm %s %u MHz video=%d offset_khz=%d -> %s\n", rf_channel()->name,
+                       rf_frequency_mhz(), v.confidence, v.offset_khz, found ? "kept" : "retry");
+            }
+        }
+    }
+    if (!found) {
+        if (original_custom) (void)rf_tune_mhz(original_mhz);
+        else (void)rf_set_channel(original);
+    }
     s_scan_active = false;
     receiver_set_gain(max_gain);
     receiver_resume();
-    printf("SCAN result=%s channel=%s\n", best_video < 0 ? "none_kept" : "found", rf_channel()->name);
+    printf("SCAN result=%s channel=%s freq=%u\n", found ? "found" : "none_kept", rf_channel()->name, rf_frequency_mhz());
     after_retune();
 }
 

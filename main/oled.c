@@ -75,8 +75,8 @@ static bool display_init(void)
         {0x40},             /* start line 0 */
         {0x8D, 0x14},       /* charge pump on */
         {0x20, 0x02},       /* page addressing */
-        {0xA1},             /* segment remap */
-        {0xC8},             /* COM scan descending */
+        {0xA0},             /* segment column 0 = SEG0 (rotated 180 deg) */
+        {0xC0},             /* COM scan ascending (rotated 180 deg) */
         {0xDA, 0x12},       /* COM pins */
         {0x81, 0xCF},       /* contrast */
         {0xD9, 0xF1},       /* precharge */

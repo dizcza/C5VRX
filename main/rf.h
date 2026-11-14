@@ -71,6 +71,14 @@ size_t rf_channel_index(void);
 uint16_t rf_channel_freq(size_t index);
 const char *rf_band_name(unsigned band);
 esp_err_t rf_set_channel(size_t index);
+/* Tune any whole MHz in RF_SWEEP_MIN_MHZ..RF_SWEEP_MAX_MHZ (frequency sweep).
+ * A table frequency selects that channel; any other becomes a custom
+ * channel named by its MHz, kept until the next channel change and not
+ * saved (rf_channel_index() still names the last table channel). */
+esp_err_t rf_tune_mhz(uint16_t mhz);
+bool rf_channel_custom(void);
+#define RF_SWEEP_MIN_MHZ 5180u
+#define RF_SWEEP_MAX_MHZ 5945u
 void rf_next_band(void);
 void rf_next_channel(void);
 uint16_t rf_frequency_mhz(void);

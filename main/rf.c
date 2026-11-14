@@ -477,7 +477,12 @@ static size_t s_index = FPV_BAND_A * 8u;   /* A1, 5865 MHz */
 static uint16_t s_freq = 5865u;
 static int s_offset_khz;
 
-const fpv_channel_t *rf_channel(void) { return &s_channels[s_index / 8u][s_index % 8u]; }
+static bool s_custom;                 /* tuned off the table by the frequency sweep */
+static char s_custom_name[6];
+static fpv_channel_t s_custom_ch = {s_custom_name, 0};
+
+const fpv_channel_t *rf_channel(void) { return s_custom ? &s_custom_ch : &s_channels[s_index / 8u][s_index % 8u]; }
+bool rf_channel_custom(void) { return s_custom; }
 uint16_t rf_channel_freq(size_t index) { return index < FPV_CHANNELS ? s_channels[index / 8u][index % 8u].freq_mhz : 0; }
 size_t rf_channel_index(void) { return s_index; }
 const char *rf_band_name(unsigned band) { return band < FPV_BANDS ? s_band_names[band] : "?"; }
@@ -490,21 +495,36 @@ int rf_offset_khz(void) { return s_offset_khz; }
 #define C5_MIN_MHZ 5180u
 #define C5_MAX_MHZ 5945u
 static const struct { uint8_t channel; uint16_t mhz; } s_centres[] = {
+    {36, 5180}, {40, 5200}, {44, 5220}, {48, 5240}, {52, 5260}, {56, 5280},
+    {60, 5300}, {64, 5320}, {100, 5500}, {104, 5520}, {108, 5540}, {112, 5560},
+    {116, 5580}, {120, 5600}, {124, 5620}, {128, 5640},
     {132, 5660}, {136, 5680}, {140, 5700}, {144, 5720},
     {149, 5745}, {153, 5765}, {157, 5785}, {161, 5805},
     {165, 5825}, {169, 5845}, {173, 5865}, {177, 5885},
 };
+#define N_CENTRES (sizeof(s_centres) / sizeof(s_centres[0]))
 
 /* Under phy_begin(). The bandwidth mode goes first: the setup builds the
  * analog filter branch from it (see rf_set_filter). */
 static esp_err_t channel_setup(uint16_t mhz)
 {
     experimental_phy_prepare_restore();
-    unsigned best = 0;
-    for (unsigned k = 1; k < sizeof(s_centres) / sizeof(s_centres[0]); ++k)
-        if (abs((int)mhz - (int)s_centres[k].mhz) < abs((int)mhz - (int)s_centres[best].mhz)) best = k;
     phy_wifi_fbw_sel(s_filter.bw20 ? 0u : 1u);
-    esp_err_t err = esp_wifi_set_channel(s_centres[best].channel, WIFI_SECOND_CHAN_NONE);
+    /* Nearest public centre first; if the regulatory domain refuses it,
+     * the next nearest (the low centres were added for the L band and the
+     * frequency sweep). */
+    bool tried[N_CENTRES] = {0};
+    esp_err_t err = ESP_FAIL;
+    unsigned best = 0;
+    for (unsigned attempt = 0; attempt < N_CENTRES && err != ESP_OK; ++attempt) {
+        int pick = -1;
+        for (unsigned k = 0; k < N_CENTRES; ++k)
+            if (!tried[k] && (pick < 0 || abs((int)mhz - (int)s_centres[k].mhz) < abs((int)mhz - (int)s_centres[pick].mhz)))
+                pick = (int)k;
+        tried[pick] = true;
+        best = (unsigned)pick;
+        err = esp_wifi_set_channel(s_centres[best].channel, WIFI_SECOND_CHAN_NONE);
+    }
     if (err == ESP_OK && mhz != s_centres[best].mhz) phy_set_freq(mhz, 0);
     if (err == ESP_OK) { s_setup_valid = true; s_setup_bw20 = s_filter.bw20; }
     return err;
@@ -524,6 +544,27 @@ esp_err_t rf_set_channel(size_t index)
         s_index = index;
         s_freq = mhz;
         s_offset_khz = 0;
+        s_custom = false;
+    }
+    phy_end();
+    return err;
+}
+
+esp_err_t rf_tune_mhz(uint16_t mhz)
+{
+    if (mhz < C5_MIN_MHZ || mhz > C5_MAX_MHZ) return ESP_ERR_NOT_SUPPORTED;
+    for (size_t i = 0; i < FPV_CHANNELS; ++i)
+        if (rf_channel_freq(i) == mhz) return rf_set_channel(i);
+    phy_begin();
+    esp_err_t err = channel_setup(mhz);
+    restore_lock();
+    if (err == ESP_OK) {
+        capture_table();
+        s_freq = mhz;
+        s_offset_khz = 0;
+        s_custom = true;
+        s_custom_ch.freq_mhz = mhz;
+        snprintf(s_custom_name, sizeof(s_custom_name), "%u", (unsigned)mhz);
     }
     phy_end();
     return err;
