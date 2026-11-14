@@ -63,9 +63,18 @@ void transport_resume_live(void);
 void transport_start_chain(dma_descriptor_t *first);
 uint32_t transport_switch_wait_ms(void);
 const char *transport_program_name(void);
-/* Decoder (transport.c): U80P64-R1 (default) or U85Q, each a fixed program
- * with its own LUT; kept in NVS "demod" (main.c, console m). */
-enum { TRANSPORT_DEMOD_P64, TRANSPORT_DEMOD_U85Q, TRANSPORT_DEMODS };
+/* Decoder (transport.c): U50P64-R1 (default), U80P64-R1 or U85Q, each a fixed
+ * program with its own LUT; kept in NVS TRANSPORT_DEMOD_KEY (main.c, console m).
+ * Operator decision 2026-11-10: the range decoder is the default and a VTX
+ * measured at deviation >= 1.10 falls back to U80P64-R1 for the session
+ * (control.c demod_deviation_guard). The key was "demod" while U80P64-R1 was
+ * the default; a choice stored under it is not read, so every board starts
+ * once on the new default. */
+/* Appended, never reordered: the NVS key and the flight log keep these values. */
+enum { TRANSPORT_DEMOD_P64, TRANSPORT_DEMOD_U85Q, TRANSPORT_DEMOD_U50P64, TRANSPORT_DEMODS };
+#define TRANSPORT_DEMOD_DEFAULT TRANSPORT_DEMOD_U50P64
+#define TRANSPORT_DEMOD_KEY "demod2"
+const char *transport_demod_short(uint8_t d);   /* menu: "P64", "U85Q", "U50" */
 uint8_t transport_demod(void);
 const char *transport_demod_name(uint8_t d);
 bool transport_set_demod(uint8_t d);
@@ -77,6 +86,8 @@ uint32_t transport_restart_errors(void);
 unsigned transport_output(void);
 const char *transport_output_name(void);
 bool transport_set_output(unsigned level);
+unsigned transport_output_word(void);          /* the verified live output: a level or an affine word */
+bool transport_set_output_affine(unsigned word);   /* AUTO OUTPUT (output_auto.h); 0 = manual level */
 void transport_stop_chain(void);
 void transport_poll_faults(void);
 uint32_t transport_fault_count(void);
@@ -122,12 +133,15 @@ extern dg_map_blob_t s_gain_map_saved;
 extern bool s_gain_map_saved_valid;
 /* Observer-owned context snapshot; refuses unsettled/changed model state. */
 unsigned receiver_export_gain_map(dg_map_blob_t *blob);
-void receiver_start(void);
+bool receiver_prepare(void); /* reserve stacks/TCBs and timer without starting gain */
+bool receiver_start(void);
 bool receiver_active(void);
 bool receiver_paused(void);
 /* Pause gain control for a calibration/scan that owns the gain itself. */
 bool receiver_pause(const char *tag);
 void receiver_resume(void);
+void receiver_pause_print(void);                /* T: PAUSES, who paused the receiver and how long */
+void output_auto_print(void);                   /* T: OUTPUT_AUTO (control.c) */
 void receiver_set_gain(uint8_t gain);
 void receiver_print(void);
 void receiver_print_map(void);   /* console M: GAINMAP line */
@@ -152,6 +166,7 @@ static inline bool receiver_gain_mode_auto(uint8_t mode)
     return mode == GAIN_MODE_AUTO || mode == GAIN_MODE_LEVEL || mode == GAIN_MODE_RSSI;
 }
 uint8_t receiver_gain_mode(void);
+unsigned receiver_strong_lane(void);   /* STRONG LANE steps in use: 0 none, 1 fine, 2 coarse (strong_lane.h) */
 void receiver_set_gain_mode(uint8_t mode, bool save);
 uint8_t receiver_gain_mode_next(uint8_t mode);
 const char *receiver_gain_mode_name(uint8_t mode, char *buf, unsigned size);
@@ -171,7 +186,7 @@ extern volatile video_standard_t s_detected_std;
 extern volatile int64_t s_last_video_us;           /* last burst-confirmed sync */
 extern QueueHandle_t s_commands;
 void control_start(void);
-bool control_prepare(void); /* reserve unchanged control stack before driver heap fragmentation */
+bool control_prepare(void); /* reserve control stack/TCB and command queue before driver allocations */
 video_standard_t menu_standard(void);
 void control_print(void);
 void control_print_beat(void);   /* STATUS line every 2 s (console.c) */

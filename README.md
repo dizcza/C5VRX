@@ -28,9 +28,12 @@ outputs composite PAL/NTSC through a passive 6-bit resistor DAC: automatic
 gain control, a quick baseline boot with manual calibration, an on-screen
 menu, and browser-based flashing and controls.
 
-The demodulator is **U80P64-R1** ([evidence and limits](docs/P64.md)). It has
-one positive NTSC check; PAL, weak-signal behaviour and range still need
-hardware validation. Board findings, including the retired U85Q/kp/LP models
+The default demodulator is **U50P64-R1**, the U80P64-R1 formulas with loop
+gain 0.50: less picture noise for a VTX of deviation up to about 1.0 at the
+cost of detail and colour level. A VTX measured wider falls back to
+**U80P64-R1** ([evidence and limits](docs/P64.md)), which has one positive
+NTSC check. U50P64-R1 is host-tested only; PAL, weak-signal behaviour and
+range still need hardware validation. Board findings, including the retired U85Q/kp/LP models
 and the removed sync flywheel, are in [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## Experimental firmware — flight safety warning
@@ -102,8 +105,10 @@ GND ---------------+------> GND (goggle / monitor AV-in ground)
 - Connect the node to the video input (tip) of the goggles, DVR or monitor,
   with a common ground. Standard E24 1 % resistors are fine; keep the wires
   short. Power comes over USB-C or the 5 V pin.
-- Too dim on some goggles: raise **OUTPUT** in the menu (0.5–5.0x, saved);
-  high levels can clip.
+- The video level is **OUTPUT** in the menu (0.5–5.0x, saved; high levels
+  can clip). EXPERIMENTAL > AUTO OUTPUT (off by default) lets it follow the
+  VTX while OUTPUT is 1.0x; every change it makes is a short (~5 ms) video
+  restart.
 - **Check the build with the DAC self-test** (`Z` or menu DAC TEST) before
   chasing picture problems: see
   [Building and testing the resistor DAC](docs/hardware/dac-build-and-test.md).
@@ -220,7 +225,7 @@ open the menu (menu: select).
 **Menu**, one list with every value in view: BAND, CHANNEL, SCAN, VIDEO
 (AUTO/NTSC/PAL), FILTER (AUTO/XNARROW/NARROW/NORMAL/WIDE), PHY FILT
 (digital filter mode), AFC (ON/OFF), CALIBRATE, OUTPUT (0.5–5.0x), GAIN
-(LEVEL/KEEL/RSSI/MAX/fixed), DEMOD (P64/U85Q), DAC TEST, EXIT. It closes after 30 s of
+(LEVEL/KEEL/RSSI/MAX/fixed), DEMOD (P64/U85Q/U50), DAC TEST, EXIT. It closes after 30 s of
 inactivity (5 min in DAC TEST); entering and leaving can interrupt video.
 GAIN defaults to **LEVEL**; KEEL and RSSI are kept for comparison
 ([AGC research](docs/FINDINGS.md)). The automatic models are remembered

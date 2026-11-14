@@ -113,6 +113,12 @@ jobs:
           /tmp/test_agc_compare_err | tail -5
           cc -O2 -std=c11 -Wall -Wextra -Werror -I../main test_agc_options.c ../main/agc.c -lm -o /tmp/test_agc_options
           /tmp/test_agc_options
+          # LEVEL and the core near the table floor (an external LNA close in)
+          cc -O2 -std=c11 -Wall -Wextra -Werror -I../main test_agc_strong.c ../main/agc.c ../main/gain.c ../main/arc_phy.c -lm -o /tmp/test_agc_strong
+          /tmp/test_agc_strong | tail -1
+          # STRONG LANE: a coarser IQ lane when the floor rows still fold (policy only)
+          cc -O2 -std=c11 -Wall -Wextra -Werror -I../main test_strong_lane.c -o /tmp/test_strong_lane
+          /tmp/test_strong_lane
           # LEVEL's carrier radius of a folded window on the exact hardware fold model (adc_fold.h)
           cc -O2 -std=c11 -Wall -Wextra -Werror -I../main test_fold_radius.c ../main/agc.c -lm -o /tmp/test_fold_radius
           /tmp/test_fold_radius
@@ -128,6 +134,9 @@ jobs:
           /tmp/test_video_quality ../research/data/afc_2026-10-18 ../research/data/edge_dc_2026-10-19 | tail -1
           cc -O2 -std=c11 -Wall -Wextra -Werror -I../main test_afc_evidence.c -o /tmp/test_afc_evidence
           /tmp/test_afc_evidence
+          # AUTO OUTPUT: affine DAC word and the sync/white-referenced level policy
+          cc -O2 -std=c11 -Wall -Wextra -Werror -I../main test_output_auto.c -lm -o /tmp/test_output_auto
+          /tmp/test_output_auto
       - name: Archived kp helper regressions (not firmware)
         shell: bash
         run: |
@@ -164,6 +173,7 @@ jobs:
           python3 test/test_phase_repair_runtime.py
           python3 test/test_calibration_search_runtime.py
           python3 test/test_manual_calibration_runtime.py
+          python3 test/test_boot_memory_runtime.py
       - name: Analytic IQ lane reference
         shell: bash
         run: |
@@ -185,6 +195,8 @@ jobs:
           /tmp/iqf-test-env/bin/python test/test_p64.py
           /tmp/iqf-test-env/bin/python test/test_picture_sync.py
           /tmp/iqf-test-env/bin/python research/p64_validation.py --check
+      - name: U50P64-R1 range decoder (table, program and transfer gates current)
+        run: /tmp/iqf-test-env/bin/python research/u50p64.py --check
       - name: Historical kp/LP replay (retired policy baseline)
         run: /tmp/iqf-test-env/bin/python research/ladder_gate.py check research/data/ladder_gate_rates.json
       - name: OUTPUT research invariants (DAC-only changes and bounded policy)

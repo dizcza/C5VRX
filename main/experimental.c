@@ -28,10 +28,22 @@ static bool save(void)
 void experimental_load(void)
 {
     experimental_blob_t b = {.version = EXP_VERSION};
-    if (!blob_load("exp", &b, sizeof(b))) {
-        /* v1 before D10: preserve existing experiments, default clock OFF. */
+    /* Items are appended, never reordered: an older, shorter blob keeps its
+     * experiments and the newer items start on their baseline (before STRONG
+     * LANE: one byte shorter; before AUTO OUTPUT: two; before Clock Pin D10:
+     * three). */
+    for (unsigned missing = 0; missing <= 3u; ++missing) {
         memset(&b, 0, sizeof(b));
-        (void)blob_load("exp", &b, sizeof(b) - 1u);
+        if (blob_load("exp", &b, sizeof(b) - missing)) break;
+        b = (experimental_blob_t){.version = EXP_VERSION};
+    }
+    /* Version 1 had AUTO OUTPUT as ON/OFF with ON the baseline: a stored 0
+     * cannot tell the default from a choice, so it starts OFF, the new
+     * baseline (an explicit OFF stays OFF). Saved by the next poll. */
+    if (b.version == EXP_VERSION_V1) {
+        b.version = EXP_VERSION;
+        b.value[EXP_OUTPUT_AUTO] = 0;
+        if (experimental_blob_valid(&b)) s_save_pending = true;
     }
     if (experimental_blob_valid(&b)) s_exp = b;
     s_clock_d10 = experimental_get(EXP_CLOCK_D10) != 0;
@@ -65,7 +77,13 @@ unsigned experimental_boot_lane(void)
     const unsigned v = experimental_get(EXP_IQ_LANE);
     return v == 1 ? RF_LANE_FINE : v == 2 ? RF_LANE_COARSE : RF_LANE_ULTRAFINE;
 }
-bool experimental_reboot_needed(void) { return rf_lane() != experimental_boot_lane() || s_clock_d10 != (experimental_get(EXP_CLOCK_D10) != 0); }
+/* A lane STRONG LANE selected live (receiver.c) is no IQ LANE experiment and
+ * needs no reboot; the transfer is still not the calibrated one. */
+static bool lane_experiment(void) { return rf_lane() != RF_LANE_ULTRAFINE && !receiver_strong_lane(); }
+bool experimental_reboot_needed(void)
+{
+    return (rf_lane() != experimental_boot_lane() && !receiver_strong_lane()) || s_clock_d10 != (experimental_get(EXP_CLOCK_D10) != 0);
+}
 bool experimental_set(unsigned item, uint8_t value)
 {
     if (item >= EXP_ITEMS || !experimental_items[item].count || value >= experimental_items[item].count) return false;
@@ -117,10 +135,12 @@ uint32_t experimental_mask(void)
     experimental_snapshot(v);
     uint32_t mask = 0;
     for (unsigned i = 0; i < EXP_ITEMS; ++i) {
-        const unsigned baseline = i == EXP_GAIN ? GAIN_MODE_DEFAULT : i == EXP_DFILT ? PHY_DFILT_MODE_DEFAULT : 0;
-        if (v[i] != baseline) mask |= 1u << i;
+        const unsigned baseline = i == EXP_GAIN ? GAIN_MODE_DEFAULT : i == EXP_DFILT ? PHY_DFILT_MODE_DEFAULT :
+                                  i == EXP_DEMOD ? TRANSPORT_DEMOD_DEFAULT : 0;
+        /* U80P64-R1 is the default decoder's own deviation fallback (control.c), not an experiment. */
+        if (v[i] != baseline && !(i == EXP_DEMOD && v[i] == TRANSPORT_DEMOD_P64)) mask |= 1u << i;
     }
-    if (rf_lane() != RF_LANE_ULTRAFINE) mask |= 1u << EXP_IQ_LANE;
+    if (lane_experiment()) mask |= 1u << EXP_IQ_LANE;
     if (s_clock_d10) mask |= 1u << EXP_CLOCK_D10;
     return mask;
 }
@@ -128,7 +148,7 @@ void experimental_effective_snapshot(uint8_t values[EXP_ITEMS])
 {
     experimental_snapshot(values);
     values[EXP_CLOCK_D10] = s_clock_d10;
-    values[EXP_IQ_LANE] = rf_lane() == RF_LANE_FINE ? 1 : rf_lane() == RF_LANE_COARSE ? 2 : 0;
+    values[EXP_IQ_LANE] = !lane_experiment() ? 0 : rf_lane() == RF_LANE_FINE ? 1 : 2;
 }
 void experimental_log_state(void)
 {

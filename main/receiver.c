@@ -13,10 +13,12 @@
 #include "cn_auto.h"
 #include "cn_observation.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "gain_map_preset.h"
 #include "phase8_gain_lut.h"
 #include "phy.h"
 #include "rf.h"
+#include "strong_lane.h"
 
 direct_gain_t s_gain;
 volatile uint8_t s_current_gain = 62u;
@@ -29,6 +31,16 @@ volatile uint32_t s_obs_us_max, s_obs_windows;
 dg_map_blob_t s_gain_map_saved;
 bool s_gain_map_saved_valid;
 
+#define OBSERVER_STACK_BYTES 4096u
+#define SENTINEL_STACK_BYTES 3072u
+
+typedef struct {
+    StaticTask_t observer, sentinel;
+    StackType_t observer_stack[OBSERVER_STACK_BYTES / sizeof(StackType_t)] __attribute__((aligned(portBYTE_ALIGNMENT)));
+    StackType_t sentinel_stack[SENTINEL_STACK_BYTES / sizeof(StackType_t)] __attribute__((aligned(portBYTE_ALIGNMENT)));
+} receiver_memory_t;
+static receiver_memory_t *s_receiver_memory;
+static esp_timer_handle_t s_gain_timer;
 static TaskHandle_t s_observer, s_sentinel;
 static volatile uint8_t s_gain_mode = GAIN_MODE_DEFAULT;
 
@@ -164,13 +176,70 @@ static void fold_measure(dg_observation_t *o, const uint8_t *samples, unsigned n
 }
 
 /* Fixed modes bypass the controller; apply_target clamps to the live table. */
+/* STRONG LANE (strong_lane.h): with the gain on the floor rows and no lower
+ * row asked, a carrier that keeps folding moves to the fine and then the
+ * coarse IQ lane; a small or absent carrier moves back. On a coarser lane
+ * the gain is held (its controller reads ultrafine cells) and the DC, level
+ * and C/N accumulators stand still (observer_task); the DC servo, the C/N
+ * reference and map learning are off there (experimental_transfer_active).
+ * The route is eight GPIO-matrix writes by the observer, no PHY register;
+ * the control epoch invalidates what was observed on the old lane. */
+static strong_lane_t s_strong;
+unsigned receiver_strong_lane(void) { return s_strong.steps; }
+static void strong_route(int step, uint64_t observed_us)
+{
+    /* The observation's own clock: the next ticks compare against it. */
+    strong_lane_applied(&s_strong, step, observed_us);
+    rf_reroute_lane(RF_LANE_ULTRAFINE - s_strong.steps);
+    ++s_control_epoch;
+    printf("STRONG_LANE lane=%s gain=G%u ups=%lu downs=%lu\n", rf_lane_name(rf_lane()), s_current_gain,
+           (unsigned long)s_strong.ups, (unsigned long)s_strong.downs);
+}
+/* Back to the ultrafine lane at once: a pause owner (calibration, scan), a
+ * fixed gain, the pair sweep or STRONG LANE = OFF. */
+static void strong_release(void)
+{
+    /* Only a lane STRONG LANE routed itself: a boot lane chosen with IQ LANE
+     * (steps 0) is not its to change. */
+    if (!s_strong.steps) return;
+    while (s_strong.steps) strong_lane_applied(&s_strong, -1, (uint64_t)esp_timer_get_time());
+    rf_reroute_lane(RF_LANE_ULTRAFINE);
+    ++s_control_epoch;
+    printf("STRONG_LANE lane=ultrafine released\n");
+}
+static bool strong_allowed(uint8_t mode)
+{
+    return !experimental_get(EXP_STRONG_LANE) && receiver_gain_mode_auto(mode) && !s_pair_active &&
+           experimental_boot_lane() == RF_LANE_ULTRAFINE;
+}
+
 static uint8_t gain_decision(const dg_observation_t *o)
 {
-    if (s_pair_active) return pair_decision(o);
     const uint8_t mode = s_gain_mode;
-    if (mode == GAIN_MODE_AUTO) return dg_tick(&s_gain, o);
-    const uint8_t target = mode == GAIN_MODE_LEVEL || mode == GAIN_MODE_RSSI ? agc_decision(mode, o)
-                         : mode == GAIN_MODE_MAX ? rf_gain_table()->max_index : mode;
+    if (s_strong.steps) {
+        if (!strong_allowed(mode)) strong_release();
+        else {
+            const int step = strong_lane_tick(&s_strong, true, agc_folded(o), o->clip_pm >= 20u, o->pwr_x16, o->observed_us);
+            if (step) strong_route(step, o->observed_us);
+            return s_current_gain;
+        }
+    }
+    if (s_pair_active) return pair_decision(o);
+    if (mode == GAIN_MODE_AUTO || mode == GAIN_MODE_LEVEL || mode == GAIN_MODE_RSSI) {
+        const uint8_t t = mode == GAIN_MODE_AUTO ? dg_tick(&s_gain, o) : agc_decision(mode, o);
+        if (strong_allowed(mode) && rf_lane() == RF_LANE_ULTRAFINE &&
+            strong_lane_tick(&s_strong, strong_lane_no_room(s_current_gain, t), agc_folded(o),
+                             o->clip_pm >= 20u, o->pwr_x16, o->observed_us) > 0) {
+            strong_route(1, o->observed_us);
+            return s_current_gain;
+        }
+        if (mode == GAIN_MODE_AUTO) return t;
+        if (t == s_current_gain && s_gain.state != DG_HOLD &&
+            o->observed_us > (uint64_t)s_last_gain_write_us && o->observed_us - (uint64_t)s_last_gain_write_us >= 2000u)
+            s_gain.state = DG_HOLD;
+        return t;
+    }
+    const uint8_t target = mode == GAIN_MODE_MAX ? rf_gain_table()->max_index : mode;
     /* Once written and settled the model reads HOLD, so profile/DC/C-N gates
      * waiting for a held gain behave as with a steady carrier. */
     if (target == s_current_gain && s_gain.state != DG_HOLD &&
@@ -273,21 +342,53 @@ bool receiver_active(void)
 
 bool receiver_paused(void) { return s_paused; }
 
+/* Every pause is recorded with its owner and duration (FLOG_E_PAUSE, T
+ * PAUSES): walk 300 lost 11 % of its seconds to an owned or paused receiver,
+ * up to 4-7 s in a row, and no record said which owner it was (FINDINGS
+ * "Next steps", 2026-10-29). While paused the gain observer stands still and
+ * the post-gain DC hook is silent. */
+static const char *s_pause_tag = "";
+static int64_t s_pause_us;
+static uint32_t s_pauses, s_pause_total_ms, s_pause_max_ms, s_pauses_video;
+static char s_pause_longest[9];
+
 bool receiver_pause(const char *tag)
 {
     if (s_paused) {
         printf("%s refused=busy\n", tag);
         return false;
     }
+    s_pause_tag = tag ? tag : "";
+    s_pause_us = esp_timer_get_time();
+    /* A pause with video in the last 3 s interrupts a picture in use. */
+    if (s_last_video_us && s_pause_us - s_last_video_us < 3000000) ++s_pauses_video;
     s_paused = true;
     vTaskDelay(pdMS_TO_TICKS(20));   /* let an in-flight window finish */
+    strong_release();                /* the owner measures on the ultrafine lane */
     return true;
 }
 
 void receiver_resume(void)
 {
     ++s_control_epoch;
+    if (s_paused) {
+        const int64_t us = esp_timer_get_time() - s_pause_us;
+        const uint32_t ms = us < 0 ? 0u : us / 1000 > UINT32_MAX ? UINT32_MAX : (uint32_t)(us / 1000);
+        uint8_t d[12] = {(uint8_t)ms, (uint8_t)(ms >> 8), (uint8_t)(ms >> 16), (uint8_t)(ms >> 24)};
+        for (unsigned k = 0; k < 8u && s_pause_tag[k]; ++k) d[4u + k] = (uint8_t)s_pause_tag[k];
+        flightlog_event(FLOG_E_PAUSE, d, sizeof(d));
+        ++s_pauses;
+        s_pause_total_ms += ms;
+        if (ms >= s_pause_max_ms) { s_pause_max_ms = ms; memcpy(s_pause_longest, d + 4, 8); s_pause_longest[8] = 0; }
+    }
     s_paused = false;
+}
+
+void receiver_pause_print(void)
+{
+    printf("PAUSES count=%lu with_recent_video=%lu total_ms=%lu max_ms=%lu longest=%s now=%s\n", (unsigned long)s_pauses,
+           (unsigned long)s_pauses_video, (unsigned long)s_pause_total_ms, (unsigned long)s_pause_max_ms,
+           s_pause_longest[0] ? s_pause_longest : "none", s_paused ? s_pause_tag : "running");
 }
 
 /* Gain write by the owner of a pause (calibration, scan). */
@@ -371,6 +472,8 @@ static rx_level_t s_level;
 static float s_noise_rel;          /* learned noise, calibration units; 0 = not yet */
 static uint16_t s_noise_freq;
 static rf_filter_t s_noise_filter;   /* the noise belongs to this filter too (NARROW reads lower) */
+static uint8_t s_level_noise_row = 255u;   /* noise-map row the level's noise came from, 255 = none */
+static float level_noise_from_map(uint8_t *row);
 static void level_accumulate(const dg_observation_t *o, uint8_t gain)
 {
     if (gain >= RX_LEVEL_ROWS || s_obs_stuck) return;
@@ -392,17 +495,25 @@ void receiver_level_roll(bool no_carrier, bool video)
         f.bw20 != s_noise_filter.bw20) {
         s_noise_freq = rf_frequency_mhz(); s_noise_filter = f; s_noise_rel = 0.0f;
     }
-    rx_level_t r = rx_level_compute(sum, n, clipped, s_gain.model_db_q8, s_gain.table.max_index, s_noise_rel);
+    /* The noise: C/N-AUTO's map of this context (with or without an external
+     * LNA, rx_level.h), else the reference learned below, else the
+     * calibration. */
+    uint8_t map_row;
+    const float map_rel = level_noise_from_map(&map_row);
+    s_level_noise_row = map_row;
+    rx_level_t r = rx_level_compute(sum, n, clipped, s_gain.model_db_q8, s_gain.table.max_index,
+                                    map_rel > 0.0f ? map_rel : s_noise_rel);
     /* Learn the noise with no carrier at the table maximum, inside -3..+4 dB
      * of the calibration (a carrier the supervisor missed stays out). */
     if (no_carrier && r.valid && r.gain_min == s_gain.table.max_index && r.rel > 0.5f && r.rel < 2.5f) {
         s_noise_rel = s_noise_rel > 0.0f ? s_noise_rel + (r.rel - s_noise_rel) / 8.0f : r.rel;
-        r = rx_level_compute(sum, n, clipped, s_gain.model_db_q8, s_gain.table.max_index, s_noise_rel);
+        if (!(map_rel > 0.0f))
+            r = rx_level_compute(sum, n, clipped, s_gain.model_db_q8, s_gain.table.max_index, s_noise_rel);
     }
     s_level = rx_level_gate(r, video);
 }
 rx_level_t receiver_level(void) { return s_level; }
-bool receiver_noise_learned(void) { return s_noise_rel > 0.0f; }
+bool receiver_noise_learned(void) { return s_level_noise_row != 255u || s_noise_rel > 0.0f; }
 /* The menu owns TX and the gain observer stands still, so the menu feeds
  * its control windows here instead (control.c), in 256-byte probes like
  * the observer's, and rolls once a second. */
@@ -539,6 +650,19 @@ bool receiver_export_noise(uint8_t row, float *cells2, uint16_t *samples, int64_
     *measured_us = s_cna_map.us[row];
     (void)xTaskResumeAll();
     return *samples >= CNA_MIN_SAMPLES && *cells2 > 0;
+}
+/* The received level's noise at the pin from the map (rx_level.h), in
+ * calibration units; 0 when the map belongs to another context or has no
+ * row. Read-only like the export: never cna_key_check() here. */
+static float level_noise_from_map(uint8_t *row)
+{
+    *row = 255u;
+    if (experimental_transfer_active() || !s_cna_key_valid || s_cna_freq != rf_frequency_mhz() ||
+        !rf_filter_equal(s_cna_filter, rf_filter())) return 0.0f;
+    vTaskSuspendAll();
+    const float rel = rx_level_noise_from_map(&s_cna_map, s_gain.model_db_q8, s_gain.table.max_index, row);
+    (void)xTaskResumeAll();
+    return rel;
 }
 
 void receiver_cn_noise_store(uint8_t row, float cells2)
@@ -911,7 +1035,7 @@ static void observer_task(void *arg)
         const dg_map_context_t after_context = map_context();
         if (phy != phy_generation() || phy_busy() || gain_epoch != s_gain_epoch || control != s_control_epoch ||
             table != rf_table_generation() || !dg_map_context_equal(&context, &after_context)) continue;
-        if (cn_gain_settled((uint64_t)t0, (uint64_t)s_last_gain_write_us, s_gain.state == DG_SETTLE)) {
+        if (!s_strong.steps && cn_gain_settled((uint64_t)t0, (uint64_t)s_last_gain_write_us, s_gain.state == DG_SETTLE)) {
             dc_accumulate(&o, sizeof(sample), s_current_gain, control, phy, table);
             level_accumulate(&o, s_current_gain);
             cna_probe(sample, sizeof(sample), &o, s_current_gain, t0);
@@ -942,20 +1066,47 @@ static void observer_task(void *arg)
     }
 }
 
-void receiver_start(void)
+/* Reserve essential task storage and timer before RF/driver allocations and
+ * the optional splash. Reservation does not start tasks or issue PHY writes. */
+bool receiver_prepare(void)
 {
+    if (!s_receiver_memory) {
+        s_receiver_memory = heap_caps_aligned_alloc(portBYTE_ALIGNMENT, sizeof(*s_receiver_memory),
+                                                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (!s_receiver_memory) return false;
+        memset(s_receiver_memory, 0, sizeof(*s_receiver_memory));
+    }
+    if (!s_gain_timer) {
+        const esp_timer_create_args_t args = {.callback = tick_cb, .dispatch_method = ESP_TIMER_TASK,
+            .name = "gain_tick", .skip_unhandled_events = true};
+        if (esp_timer_create(&args, &s_gain_timer) != ESP_OK) {
+            heap_caps_free(s_receiver_memory);
+            s_receiver_memory = NULL;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool receiver_start(void)
+{
+    if (s_observer && s_sentinel) return true;
+    if (!receiver_prepare()) return false;
     s_gain_map_saved_valid = blob_load("gain_map", &s_gain_map_saved, sizeof(s_gain_map_saved)) &&
                              s_gain_map_saved.version == DG_MAP_VERSION && s_gain_map_saved.context_valid;
-    ESP_ERROR_CHECK(xTaskCreate(observer_task, "gain_obs", 4096, NULL, 3, &s_observer) == pdPASS ?
-                    ESP_OK : ESP_ERR_NO_MEM);
-    ESP_ERROR_CHECK(xTaskCreate(sentinel_task, "gain_fast", 3072, NULL, 4, &s_sentinel) == pdPASS ?
-                    ESP_OK : ESP_ERR_NO_MEM);
+    /* Keep the existing start point: the splash owns TX before gain runs.
+     * Stack depths are bytes in IDF; no task storage is allocated here. */
+    s_observer = xTaskCreateStatic(observer_task, "gain_obs", OBSERVER_STACK_BYTES, NULL, 3,
+                                  s_receiver_memory->observer_stack, &s_receiver_memory->observer);
+    if (!s_observer) return false;
+    s_sentinel = xTaskCreateStatic(sentinel_task, "gain_fast", SENTINEL_STACK_BYTES, NULL, 4,
+                                  s_receiver_memory->sentinel_stack, &s_receiver_memory->sentinel);
     /* Notifications request a fresh snapshot, not replay of missed samples. */
-    const esp_timer_create_args_t args = {.callback = tick_cb, .dispatch_method = ESP_TIMER_TASK,
-        .name = "gain_tick", .skip_unhandled_events = true};
-    esp_timer_handle_t timer;
-    ESP_ERROR_CHECK(esp_timer_create(&args, &timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(timer, 200));
+    if (s_sentinel && esp_timer_start_periodic(s_gain_timer, 200) == ESP_OK) return true;
+    if (s_sentinel) vTaskDelete(s_sentinel);
+    vTaskDelete(s_observer);
+    s_observer = s_sentinel = NULL;
+    return false;
 }
 
 void receiver_print(void)
@@ -972,17 +1123,21 @@ void receiver_print(void)
                (unsigned long)s_agc.rssi.folds);
     const rx_level_t lv = s_level;
     if (lv.valid)
-        printf("RX_LEVEL carrier_dbm=%.1f input_dbm=%.1f noise_dbm=%.1f noise_learned=%u cn_db=%.1f above_noise=%u exact=%u gains=%u-%u probes=%lu clipped_pm=%u "
+        printf("RX_LEVEL carrier_dbm=%.1f input_dbm=%.1f noise_dbm=%.1f noise_learned=%u noise_src=%s noise_row=%u cn_db=%.1f above_noise=%u exact=%u gains=%u-%u probes=%lu clipped_pm=%u "
                "(at the chip pin; calibrated against the Wi-Fi PHY RSSI: +-1 dB at G54-G83, a few dB below G54; "
                "free space for 25 mW, 2 dBi each side, 10 m at 5.8 GHz is ~-50 dBm)\n",
-               lv.carrier_dbm_x10 / 10.0, lv.input_dbm_x10 / 10.0, lv.noise_dbm_x10 / 10.0, (unsigned)(s_noise_rel > 0.0f),
-               lv.cn_x10 / 10.0,
+               lv.carrier_dbm_x10 / 10.0, lv.input_dbm_x10 / 10.0, lv.noise_dbm_x10 / 10.0,
+               (unsigned)receiver_noise_learned(),
+               s_level_noise_row != 255u ? "map" : s_noise_rel > 0.0f ? "g83" : "cal",
+               s_level_noise_row != 255u ? (unsigned)s_level_noise_row : 0u, lv.cn_x10 / 10.0,
                (unsigned)lv.above_noise, (unsigned)lv.exact, lv.gain_min, lv.gain_max, (unsigned long)lv.probes,
                lv.clipped_pm);
     else
         printf("RX_LEVEL unknown probes=%lu clipped_pm=%u\n", (unsigned long)lv.probes, lv.clipped_pm);
     printf("GAIN_SAT one_sided=%lu two_sided=%lu to_dc_servo=%lu (saturated observer windows: one rail per axis = DC-pushed, both = large signal; one-sided ones go to the DC servo, not the gain)\n",
            (unsigned long)s_sat_one_sided, (unsigned long)s_sat_two_sided, (unsigned long)s_gain.one_sided_clips);
+    printf("STRONG_LANE enabled=%u lane=%s steps=%u ups=%lu downs=%lu (a coarser IQ lane while the floor rows still fold; EXPERIMENTAL > STRONG LANE)\n",
+           !experimental_get(EXP_STRONG_LANE), rf_lane_name(rf_lane()), s_strong.steps, (unsigned long)s_strong.ups, (unsigned long)s_strong.downs);
     printf("GAIN_WRITES attack=%lu release=%lu refused=%lu rebinds=%lu overloads=%lu overloads_after_write=%lu heat_events=%lu sentinel_forwarded=%lu sentinel_dropped=%lu (why the gain moved; rebinds keep the core's memory on the same receiver; sentinel = 64-sample fast path, gross saturation only)\n",
            (unsigned long)s_gain.writes_severe, (unsigned long)s_gain.writes_moderate, (unsigned long)s_gain.writes_refused,
            (unsigned long)s_rebinds, (unsigned long)s_gain.overloads, (unsigned long)s_gain.overloads_after_write, (unsigned long)s_gain.heat_events,

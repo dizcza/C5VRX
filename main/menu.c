@@ -212,7 +212,7 @@ void menu_render(void)
         .detected_valid = s_detected_std_valid, .detected_pal = s_detected_std == VIDEO_STD_PAL,
         .output = transport_output(), .output_name = transport_output_name(),
         .gain_mode = receiver_gain_mode_name(mode, gain_mode, sizeof(gain_mode)), .gain_auto = receiver_gain_mode_auto(mode),
-        .demod = transport_demod() == TRANSPORT_DEMOD_U85Q ? "U85Q" : "P64",
+        .demod = transport_demod_short(transport_demod()),
         .gain = s_current_gain, .gain_max = rf_gain_table()->max_index,
         .filter_mode = selected == PROFILE_SELECT_AUTO ? "AUTO" : s_class[selected],
         .filter_active = active >= 0 && active < PROFILES ? s_class[active] : "?",
@@ -257,7 +257,7 @@ static void free_nodes(void)
     s_chunk_count = s_node_capacity = s_node_count = 0;
 }
 
-/* Count the raster, reserve exactly that (grow only), link a cycle.
+/* Count the raster, reserve exactly that, link a cycle.
  * Interlaced first; the progressive field only when its chain cannot be
  * reserved (half the descriptors, but not every display keeps it). */
 static esp_err_t reserve_chain(video_standard_t standard, bool interlaced, unsigned *required)
@@ -268,6 +268,13 @@ static esp_err_t reserve_chain(video_standard_t standard, bool interlaced, unsig
     if (!menu_raster_emit(&s_raster, standard, interlaced, count_segment, required) || !*required)
         return ESP_ERR_INVALID_SIZE;
     unsigned chunks = (*required + NODE_CHUNK - 1u) / NODE_CHUNK;
+    /* A failed interlaced attempt can leave more chunks than progressive
+     * needs. TX is stopped (or this is initial entry): release the excess. */
+    while (s_chunk_count > chunks) {
+        heap_caps_free(s_chunks[--s_chunk_count]);
+        s_chunks[s_chunk_count] = NULL;
+        s_node_capacity -= NODE_CHUNK;
+    }
     while (s_chunk_count < chunks) {
         dma_descriptor_t *c = heap_caps_aligned_alloc(4u, NODE_CHUNK * sizeof(dma_descriptor_t),
                                                       MALLOC_CAP_DMA_DESC_AHB | MALLOC_CAP_INTERNAL);
